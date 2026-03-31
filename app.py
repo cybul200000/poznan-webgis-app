@@ -28,9 +28,6 @@ MAP_HEIGHT = "72vh"
 # ============================================================
 
 def score_to_color(score):
-    """
-    Skala kolorów: czerwony -> żółty -> zielony
-    """
     if score < 20:
         return "#a50026"
     elif score < 35:
@@ -42,19 +39,12 @@ def score_to_color(score):
     elif score < 80:
         return "#a6d96a"
     else:
-        return "#1a9850"
+        return "#0b6e3f"
 
 
 def weighted_score(props, weights):
-    """
-    Liczy wynik końcowy z już wyliczonych wskaźników cząstkowych:
-    - score_green
-    - score_transport
-    - score_education
-    - score_food
-    - score_peace
-    """
     total_weight = sum(weights.values())
+
     if total_weight == 0:
         return round(
             (
@@ -78,12 +68,27 @@ def weighted_score(props, weights):
     return round(score, 2)
 
 
+def safe_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
 def build_feature_list(gdf_4326, weights):
-    """
-    Tworzy listę obiektów z nowym wynikiem końcowym liczonym
-    dynamicznie wg aktualnych wag.
-    """
     features = []
+
     for _, row in gdf_4326.iterrows():
         props = row.drop(labels="geometry").to_dict()
 
@@ -106,22 +111,72 @@ def build_feature_list(gdf_4326, weights):
 
 
 def polygon_positions_from_feature(feature):
-    """
-    Zamienia geometrię GeoJSON Polygon na format positions dla dash-leaflet.
-    GeoJSON ma [lon, lat], a dash-leaflet chce [lat, lon].
-    """
-    coords = feature["geometry"]["coordinates"]
+    geom = feature["geometry"]
+    geom_type = geom["type"]
+    coords = geom["coordinates"]
 
-    # Polygon -> bierzemy tylko zewnętrzny pierścień
-    outer_ring = coords[0]
-    positions = [[lat, lon] for lon, lat in outer_ring]
-    return positions
+    if geom_type == "Polygon":
+        outer_ring = coords[0]
+        return [[lat, lon] for lon, lat in outer_ring]
+
+    elif geom_type == "MultiPolygon":
+        all_polygons = []
+        for polygon in coords:
+            outer_ring = polygon[0]
+            all_polygons.append([[lat, lon] for lon, lat in outer_ring])
+        return all_polygons
+
+    return []
+
+
+def feature_center_zoom(feature, default_center, default_zoom=11):
+    if feature is None:
+        return default_center, default_zoom
+
+    geom = feature["geometry"]
+    geom_type = geom["type"]
+    coords = geom["coordinates"]
+
+    lons = []
+    lats = []
+
+    if geom_type == "Polygon":
+        for lon, lat in coords[0]:
+            lons.append(lon)
+            lats.append(lat)
+
+    elif geom_type == "MultiPolygon":
+        for polygon in coords:
+            for lon, lat in polygon[0]:
+                lons.append(lon)
+                lats.append(lat)
+
+    if not lons or not lats:
+        return default_center, default_zoom
+
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+
+    c_lat = (min_lat + max_lat) / 2
+    c_lon = (min_lon + max_lon) / 2
+
+    max_dim = max(max_lon - min_lon, max_lat - min_lat)
+
+    if max_dim > 0.08:
+        zoom = 12
+    elif max_dim > 0.04:
+        zoom = 13
+    elif max_dim > 0.02:
+        zoom = 14
+    elif max_dim > 0.01:
+        zoom = 15
+    else:
+        zoom = 16
+
+    return [c_lat, c_lon], zoom
 
 
 def build_map_layers(features, selected_os_id=None):
-    """
-    Buduje polygon layers dla mapy.
-    """
     layers = []
 
     for feature in features:
@@ -131,16 +186,17 @@ def build_map_layers(features, selected_os_id=None):
         score = props["dynamic_score_final"]
         color = props["dynamic_color"]
 
-        is_selected = (selected_os_id == os_id)
+        is_selected = str(selected_os_id) == str(os_id)
+        positions = polygon_positions_from_feature(feature)
 
         polygon = dl.Polygon(
             id={"type": "osiedle-polygon", "index": str(os_id)},
-            positions=polygon_positions_from_feature(feature),
+            positions=positions,
             pathOptions={
                 "fillColor": color,
-                "fillOpacity": 0.65,
-                "color": "#1f2937" if is_selected else "#ffffff",
-                "weight": 4 if is_selected else 1.8,
+                "fillOpacity": 0.8,
+                "color": "#111827" if is_selected else "#d1d5db",
+                "weight": 2.5 if is_selected else 1.2,
                 "opacity": 1.0,
             },
             children=[
@@ -161,14 +217,15 @@ def build_map_layers(features, selected_os_id=None):
     return layers
 
 
-def build_top_list(features, top_n=10):
+def build_top_list(features, selected_os_id=None, top_n=10):
     items = []
     medals = ["🥇", "🥈", "🥉"]
 
     for i, feature in enumerate(features[:top_n]):
         props = feature["properties"]
+        os_id = str(props["os_id"])
         prefix = medals[i] if i < 3 else f"{i+1}."
-        color = "success" if i == 0 else "light"
+        is_selected = str(selected_os_id) == os_id
 
         items.append(
             dbc.ListGroupItem(
@@ -180,9 +237,13 @@ def build_top_list(features, top_n=10):
                         className="fw-bold"
                     ),
                 ],
-                color=color,
+                id={"type": "top-item", "index": os_id},
+                action=True,
+                active=is_selected,
+                color="success" if i == 0 and not is_selected else None,
             )
         )
+
     return items
 
 
@@ -193,14 +254,21 @@ def find_feature_by_os_id(features, os_id):
     return None
 
 
-def details_card(feature):
+def find_rank_by_os_id(features, os_id):
+    for i, feature in enumerate(features, start=1):
+        if str(feature["properties"]["os_id"]) == str(os_id):
+            return i
+    return None
+
+
+def details_card(feature, rank=None, total_count=None):
     if feature is None:
         return dbc.Card(
             dbc.CardBody(
                 [
                     html.H5("Szczegóły osiedla", className="card-title"),
                     html.P(
-                        "Kliknij osiedle na mapie, aby zobaczyć szczegóły.",
+                        "Kliknij osiedle na mapie albo w rankingu, aby zobaczyć szczegóły.",
                         className="text-muted mb-0",
                     ),
                 ]
@@ -226,7 +294,11 @@ def details_card(feature):
                             },
                         ),
                     ],
-                    className="mb-3",
+                    className="mb-2",
+                ),
+                html.P(
+                    f"Pozycja w rankingu: {rank} / {total_count}" if rank is not None else "",
+                    className="text-muted mb-3",
                 ),
                 html.Hr(),
                 html.P(f"Zieleń i rekreacja: {p['score_green']:.2f}/100", className="mb-1"),
@@ -234,15 +306,20 @@ def details_card(feature):
                 html.P(f"Edukacja: {p['score_education']:.2f}/100", className="mb-1"),
                 html.P(f"Rozrywka i gastronomia: {p['score_food']:.2f}/100", className="mb-1"),
                 html.P(f"Spokój / brak hałasu: {p['score_peace']:.2f}/100", className="mb-3"),
-
                 html.Hr(),
                 html.H6("Dane źródłowe", className="mb-2"),
-                html.P(f"Parki w 2 km: {int(p['park_count_2km'])}", className="mb-1"),
-                html.P(f"Szkoły w 2 km: {int(p['school_count_2km'])}", className="mb-1"),
-                html.P(f"Przystanki w 800 m: {int(p['stop_count_800m'])}", className="mb-1"),
-                html.P(f"Restauracje w 1.5 km: {int(p['food_count_1500m'])}", className="mb-1"),
-                html.P(f"Udział zieleni: {round(float(p['green_share']) * 100, 2)}%", className="mb-1"),
-                html.P(f"Długość dróg głównych: {round(float(p['road_length_m']), 1)} m", className="mb-0"),
+                html.P(f"Parki w 2 km: {safe_int(p.get('park_count_2km'))}", className="mb-1"),
+                html.P(f"Szkoły w 2 km: {safe_int(p.get('school_count_2km'))}", className="mb-1"),
+                html.P(f"Przystanki w 800 m: {safe_int(p.get('stop_count_800m'))}", className="mb-1"),
+                html.P(f"Restauracje w 1.5 km: {safe_int(p.get('food_count_1500m'))}", className="mb-1"),
+                html.P(
+                    f"Udział zieleni: {round(safe_float(p.get('green_share')) * 100, 2)}%",
+                    className="mb-1"
+                ),
+                html.P(
+                    f"Długość dróg głównych: {round(safe_float(p.get('road_length_m')), 1)} m",
+                    className="mb-0"
+                ),
             ]
         ),
         className="border-0 shadow-sm",
@@ -255,16 +332,16 @@ def details_card(feature):
 
 gdf = gpd.read_file(GEOJSON_PATH)
 
-# GeoJSON masz w EPSG:2180, więc do mapy trzeba przeliczyć na 4326
 if gdf.crs is None:
     raise ValueError("Warstwa osiedla_wyniki.geojson nie ma CRS.")
+
 gdf_4326 = gdf.to_crs(epsg=4326)
 
 bounds = gdf_4326.total_bounds  # minx, miny, maxx, maxy
 center_lat = (bounds[1] + bounds[3]) / 2
 center_lon = (bounds[0] + bounds[2]) / 2
-
-initial_features = build_feature_list(gdf_4326, DEFAULT_WEIGHTS)
+default_map_center = [center_lat, center_lon]
+default_map_zoom = 11
 
 
 # ============================================================
@@ -281,7 +358,7 @@ sidebar = html.Div(
         html.Hr(),
         html.P("Ustaw wagi dla poszczególnych wskaźników:", className="text-muted"),
 
-        html.Label("Zieleń i rekreacja", className="fw-semibold"),
+        html.Label(id="label-green", className="fw-semibold"),
         dcc.Slider(
             0, 100, 10,
             value=DEFAULT_WEIGHTS["green"],
@@ -291,7 +368,7 @@ sidebar = html.Div(
         ),
         html.Br(),
 
-        html.Label("Komunikacja miejska", className="fw-semibold"),
+        html.Label(id="label-transport", className="fw-semibold"),
         dcc.Slider(
             0, 100, 10,
             value=DEFAULT_WEIGHTS["transport"],
@@ -301,7 +378,7 @@ sidebar = html.Div(
         ),
         html.Br(),
 
-        html.Label("Edukacja", className="fw-semibold"),
+        html.Label(id="label-education", className="fw-semibold"),
         dcc.Slider(
             0, 100, 10,
             value=DEFAULT_WEIGHTS["education"],
@@ -311,7 +388,7 @@ sidebar = html.Div(
         ),
         html.Br(),
 
-        html.Label("Rozrywka i gastronomia", className="fw-semibold"),
+        html.Label(id="label-food", className="fw-semibold"),
         dcc.Slider(
             0, 100, 10,
             value=DEFAULT_WEIGHTS["food"],
@@ -321,7 +398,7 @@ sidebar = html.Div(
         ),
         html.Br(),
 
-        html.Label("Spokój / brak hałasu", className="fw-semibold"),
+        html.Label(id="label-peace", className="fw-semibold"),
         dcc.Slider(
             0, 100, 10,
             value=DEFAULT_WEIGHTS["peace"],
@@ -332,10 +409,10 @@ sidebar = html.Div(
         html.Br(),
 
         dbc.Button(
-            "Przelicz ranking",
-            id="btn-recalculate",
-            color="primary",
-            className="w-100 shadow-sm",
+            "Reset wag",
+            id="btn-reset",
+            color="secondary",
+            className="w-100 shadow-sm mb-3",
             n_clicks=0,
         ),
 
@@ -384,7 +461,7 @@ sidebar = html.Div(
                                     "display": "inline-block",
                                     "width": "18px",
                                     "height": "18px",
-                                    "backgroundColor": "#1a9850",
+                                    "backgroundColor": "#0b6e3f",
                                     "marginRight": "8px",
                                     "borderRadius": "3px",
                                 }
@@ -431,8 +508,8 @@ app.layout = dbc.Container(
                                                 [
                                                     dl.Map(
                                                         id="map",
-                                                        center=[center_lat, center_lon],
-                                                        zoom=11,
+                                                        center=default_map_center,
+                                                        zoom=default_map_zoom,
                                                         children=[
                                                             dl.TileLayer(),
                                                             dl.LayerGroup(id="osiedla-layer"),
@@ -487,16 +564,33 @@ app.layout = dbc.Container(
 # ============================================================
 
 @app.callback(
-    Output("weights-store", "data"),
-    Input("btn-recalculate", "n_clicks"),
-    State("slider-green", "value"),
-    State("slider-transport", "value"),
-    State("slider-education", "value"),
-    State("slider-food", "value"),
-    State("slider-peace", "value"),
-    prevent_initial_call=False,
+    Output("slider-green", "value"),
+    Output("slider-transport", "value"),
+    Output("slider-education", "value"),
+    Output("slider-food", "value"),
+    Output("slider-peace", "value"),
+    Input("btn-reset", "n_clicks"),
+    prevent_initial_call=True,
 )
-def update_weights_store(n_clicks, green, transport, education, food, peace):
+def reset_sliders(n_clicks):
+    return (
+        DEFAULT_WEIGHTS["green"],
+        DEFAULT_WEIGHTS["transport"],
+        DEFAULT_WEIGHTS["education"],
+        DEFAULT_WEIGHTS["food"],
+        DEFAULT_WEIGHTS["peace"],
+    )
+
+
+@app.callback(
+    Output("weights-store", "data"),
+    Input("slider-green", "value"),
+    Input("slider-transport", "value"),
+    Input("slider-education", "value"),
+    Input("slider-food", "value"),
+    Input("slider-peace", "value"),
+)
+def update_weights_store(green, transport, education, food, peace):
     return {
         "green": green,
         "transport": transport,
@@ -507,18 +601,45 @@ def update_weights_store(n_clicks, green, transport, education, food, peace):
 
 
 @app.callback(
+    Output("label-green", "children"),
+    Output("label-transport", "children"),
+    Output("label-education", "children"),
+    Output("label-food", "children"),
+    Output("label-peace", "children"),
+    Input("slider-green", "value"),
+    Input("slider-transport", "value"),
+    Input("slider-education", "value"),
+    Input("slider-food", "value"),
+    Input("slider-peace", "value"),
+)
+def update_slider_labels(green, transport, education, food, peace):
+    return (
+        f"Zieleń i rekreacja ({green})",
+        f"Komunikacja miejska ({transport})",
+        f"Edukacja ({education})",
+        f"Rozrywka i gastronomia ({food})",
+        f"Spokój / brak hałasu ({peace})",
+    )
+
+
+@app.callback(
     Output("selected-os-id", "data"),
     Input({"type": "osiedle-polygon", "index": ALL}, "n_clicks"),
+    Input({"type": "top-item", "index": ALL}, "n_clicks"),
     State("selected-os-id", "data"),
     prevent_initial_call=True,
 )
-def update_selected_osiedle(n_clicks_list, current_selected):
+def update_selected_osiedle(map_clicks, top_clicks, current_selected):
     if not ctx.triggered_id:
         return current_selected
 
     triggered = ctx.triggered_id
-    if isinstance(triggered, dict) and triggered.get("type") == "osiedle-polygon":
-        return triggered.get("index")
+
+    if isinstance(triggered, dict):
+        if triggered.get("type") == "osiedle-polygon":
+            return triggered.get("index")
+        if triggered.get("type") == "top-item":
+            return triggered.get("index")
 
     return current_selected
 
@@ -537,14 +658,39 @@ def update_map_and_panels(weights, selected_os_id):
         selected_os_id = str(features[0]["properties"]["os_id"])
 
     selected_feature = find_feature_by_os_id(features, selected_os_id)
+    selected_rank = find_rank_by_os_id(features, selected_os_id)
 
     layers = build_map_layers(features, selected_os_id=selected_os_id)
-    top_items = build_top_list(features, top_n=10)
-    details = details_card(selected_feature)
+    top_items = build_top_list(features, selected_os_id=selected_os_id, top_n=10)
+    details = details_card(
+        selected_feature,
+        rank=selected_rank,
+        total_count=len(features),
+    )
 
     return layers, top_items, details
 
+@app.callback(
+    Output("map", "center"),
+    Output("map", "zoom"),
+    Input("selected-os-id", "data"),
+    Input("weights-store", "data"),
+)
+def update_map_view(selected_os_id, weights):
+    features = build_feature_list(gdf_4326, weights)
 
+    if selected_os_id is None and features:
+        selected_os_id = str(features[0]["properties"]["os_id"])
+
+    selected_feature = find_feature_by_os_id(features, selected_os_id)
+
+    selected_center, selected_zoom = feature_center_zoom(
+        selected_feature,
+        default_center=default_map_center,
+        default_zoom=default_map_zoom,
+    )
+
+    return selected_center, selected_zoom
 # ============================================================
 # START
 # ============================================================
