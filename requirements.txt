@@ -2,6 +2,8 @@ dash
 dash-bootstrap-components
 dash-leaflet
 geopandas
+pandas
+pyogrio
 gunicorn
 fiona
 pyproj
